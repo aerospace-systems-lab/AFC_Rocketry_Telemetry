@@ -8,174 +8,19 @@
 #include "Adafruit_BMP3XX.h"
 
 #include <OpenLogManager.h>
+#include <TinyGPSPlus.h>
 
 // =====================================================
 // GPS UART
 // =====================================================
 #define GPS_SERIAL Serial2
+TinyGPSPlus gps;
+
+// =====================================================
+// Logger UART
+// =====================================================
 #define LOG_SERIAL Serial1
 OpenLogManager myLogger(LOG_SERIAL);
-// =====================================================
-// UBX parser state machine
-// =====================================================
-uint8_t state = 0;
-uint8_t msgClass = 0;
-uint8_t msgId = 0;
-uint16_t length = 0;
-uint16_t UBXindex = 0;
-uint8_t payload[128];
-
-uint8_t ckA = 0, ckB = 0;          // <-- ADD THESE
-
-volatile int32_t lat_latched = 0;
-volatile int32_t lon_latched = 0;
-volatile int32_t alt_latched = 0;
-volatile uint8_t fix_latched = 0;
-volatile uint8_t sv_latched = 0;
-
-// =====================================================
-// GPS data structure
-// =====================================================
-struct GPSData {
-  int32_t lat;
-  int32_t lon;
-  int32_t hMSL;
-
-  uint8_t fixType;
-  uint8_t numSV;
-
-  uint8_t hour, minute, second;
-  uint16_t year;
-  uint8_t month, day;
-
-  uint32_t gSpeed;
-  int32_t headMot;
-};
-
-GPSData gps;
-
-// =====================================================
-// NAV-PVT parser
-// =====================================================
-void parseNavPVT(uint8_t *p) {
-
-  gps.year   = p[4] | (p[5] << 8);
-  gps.month  = p[6];
-  gps.day    = p[7];
-
-  gps.hour   = p[8];
-  gps.minute = p[9];
-  gps.second = p[10];
-
-  gps.fixType = p[20];
-  gps.numSV   = p[23];
-
-  gps.lon = (int32_t)(
-    (uint32_t)p[24] |
-    ((uint32_t)p[25] << 8) |
-    ((uint32_t)p[26] << 16) |
-    ((uint32_t)p[27] << 24)
-  );
-
-  gps.lat = (int32_t)(
-    (uint32_t)p[28] |
-    ((uint32_t)p[29] << 8) |
-    ((uint32_t)p[30] << 16) |
-    ((uint32_t)p[31] << 24)
-  );
-
-  gps.hMSL = (int32_t)(
-    (uint32_t)p[36] |
-    ((uint32_t)p[37] << 8) |
-    ((uint32_t)p[38] << 16) |
-    ((uint32_t)p[39] << 24)
-  );
-
-  gps.gSpeed = (uint32_t)(
-    (uint32_t)p[60] |
-    ((uint32_t)p[61] << 8) |
-    ((uint32_t)p[62] << 16) |
-    ((uint32_t)p[63] << 24)
-  );
-
-  gps.headMot = (int32_t)(
-    (uint32_t)p[64] |
-    ((uint32_t)p[65] << 8) |
-    ((uint32_t)p[66] << 16) |
-    ((uint32_t)p[67] << 24)
-  );
-}
-
-// =====================================================
-// UBX reader
-// =====================================================
-void readUBX() {
-
-  while (GPS_SERIAL.available()) {
-
-    uint8_t b = GPS_SERIAL.read();
-
-    switch (state) {
-
-      case 0: if (b == 0xB5) state = 1; break;
-      case 1: state = (b == 0x62) ? 2 : 0; break;
-
-      case 2: msgClass = b; state = 3; break;
-      case 3: msgId = b; state = 4; break;
-
-      case 4:
-        length = b;
-        state = 5;
-        break;
-
-      case 5:
-        length |= (uint16_t)b << 8;
-        UBXindex = 0;
-        state = (length <= sizeof(payload)) ? 6 : 0;
-        break;
-
-      case 6:
-        payload[UBXindex++] = b;
-        if (UBXindex >= length) state = 7;
-        break;
-
-      case 7:  // first checksum byte
-  ckA = b;
-  state = 8;
-  break;
-
-case 8:  // second checksum byte — now validate and parse
-  ckB = b;
-  {
-    // Compute expected checksum over class, id, length bytes, and payload
-    uint8_t cA = 0, cB = 0;
-    cA += msgClass; cB += cA;
-    cA += msgId;    cB += cA;
-    cA += (length & 0xFF);       cB += cA;
-    cA += (length >> 8) & 0xFF;  cB += cA;
-    for (uint16_t i = 0; i < length; i++) {
-      cA += payload[i];
-      cB += cA;
-    }
-
-    if (cA == ckA && cB == ckB) {
-      if (msgClass == 0x01 && msgId == 0x07) {
-        parseNavPVT(payload);
-        if (gps.fixType >= 3) {
-          lat_latched = gps.lat;
-          lon_latched = gps.lon;
-          alt_latched = gps.hMSL;
-          fix_latched = gps.fixType;
-          sv_latched  = gps.numSV;
-        }
-      }
-    }
-  }
-  state = 0;
-  break;
-    }
-  }
-}
 
 // =====================================================
 // SX1280 RADIO
@@ -188,11 +33,11 @@ SX1280 radio = new Module(17, 13, 15, 14);
 Adafruit_LIS3DH lis;
 Adafruit_BMP3XX bmp;
 float LocalPressure = 0;
+
 // =====================================================
 // TIMERS
 // =====================================================
 #include <Chrono.h>
-
 Chrono sensorTimer;
 Chrono txTimer;
 
@@ -231,23 +76,6 @@ uint8_t calculateChecksum(uint8_t* data, int len) {
   uint8_t sum = 0;
   for (int i = 0; i < len; i++) sum ^= data[i];
   return sum;
-}
-
-// =====================================================
-// I2C SCANNER (DEBUG TOOL)
-// =====================================================
-void scanI2C() {
-  Serial.println("🔍 I2C scanning...");
-
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      Serial.print("Found device at 0x");
-      Serial.println(addr, HEX);
-    }
-  }
-
-  Serial.println("Done.");
 }
 
 // =====================================================
@@ -316,7 +144,7 @@ void setup() {
   }
 
   radio.setFrequency(2400.0);
-  radio.setBandwidth(812.5);
+  radio.setBandwidth(406);
   radio.setSpreadingFactor(7);
   radio.setCodingRate(5);
   radio.setSyncWord(0x12);
@@ -341,7 +169,10 @@ void setup() {
 // =====================================================
 void loop() {
 
-  readUBX();
+  // Feed all available GPS bytes to TinyGPSPlus
+  while (GPS_SERIAL.available()) {
+    gps.encode(GPS_SERIAL.read());
+  }
 
   // 50Hz SENSOR UPDATE
   if (sensorTimer.hasPassed(20, true)) {
@@ -361,30 +192,38 @@ void loop() {
     pkt.temperature = temp * 100;
     pkt.baroAlt = baroAlt * 10;
 
-    pkt.satellites = sv_latched;
-    pkt.gpsFix = fix_latched;
+    // GPS: require a valid fix with at least 6 satellites
+    bool goodFix = gps.location.isValid()
+                && gps.satellites.isValid()
+                && gps.satellites.value() >= 6;
 
-    if (fix_latched >= 3 && sv_latched >= 6) {
-      pkt.latitude = lat_latched;
-      pkt.longitude = lon_latched;
-      pkt.gpsAlt = alt_latched / 1000;
+    if (goodFix) {
+      // Convert double degrees → int32 in units of 1e-7 degrees, matching your old UBX format
+      pkt.latitude   = (int32_t)(gps.location.lat() * 1e7);
+      pkt.longitude  = (int32_t)(gps.location.lng() * 1e7);
+      pkt.gpsAlt     = gps.altitude.isValid() ? (int16_t)(gps.altitude.meters()) : 0;
+      pkt.satellites = (uint8_t)gps.satellites.value();
+      pkt.gpsFix     = 3;   // TinyGPSPlus doesn't expose UBX fix type; 3 = 3D fix equivalent
     } else {
-      pkt.latitude = 0;
-      pkt.longitude = 0;
-      pkt.gpsAlt = 0;
+      pkt.latitude   = 0;
+      pkt.longitude  = 0;
+      pkt.gpsAlt     = 0;
+      pkt.satellites = gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0;
+      pkt.gpsFix     = 0;
     }
+
     char line[160];
 
     snprintf(line, sizeof(line),
-    "%lu,%.3f,%.3f,%.3f,%.2f,%.1f,%ld,%ld,%u,%u\n",
+    "%lu,%.3f,%.3f,%.3f,%.2f,%.1f,%.6f,%.6f,%u,%u\n",
     millis(),
     event.acceleration.x / 9.81f,   // G
     event.acceleration.y / 9.81f,
     event.acceleration.z / 9.81f,
     temp,                             // °C
     baroAlt,                          // m
-    pkt.latitude,                     // raw int32 (1e-7 deg)
-    pkt.longitude,
+    pkt.latitude / 1e7f,                     // float, in deg 
+    pkt.longitude / 1e7f,
     pkt.satellites,
     pkt.gpsFix
 );
