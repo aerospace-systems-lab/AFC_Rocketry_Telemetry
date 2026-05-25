@@ -11,19 +11,19 @@
 #include <TinyGPSPlus.h>
 
 // =====================================================
-// GPS UART
+// GPS
 // =====================================================
 #define GPS_SERIAL Serial2
 TinyGPSPlus gps;
 
 // =====================================================
-// Logger UART
+// Logger
 // =====================================================
 #define LOG_SERIAL Serial1
 OpenLogManager myLogger(LOG_SERIAL);
 
 // =====================================================
-// SX1280 RADIO
+// RADIO
 // =====================================================
 SX1280 radio = new Module(17, 13, 15, 14);
 
@@ -42,29 +42,27 @@ Chrono sensorTimer;
 Chrono txTimer;
 
 // =====================================================
-// TELEMETRY PACKET
+// RADIO STATE
+// =====================================================
+bool txBusy = false;
+
+// =====================================================
+// TELEMETRY
 // =====================================================
 #pragma pack(push, 1)
 struct TelemetryPacket {
-
   uint16_t magic;
-  uint8_t  version;
-
+  uint8_t version;
   int16_t xAcc;
   int16_t yAcc;
   int16_t zAcc;
-
   int16_t temperature;
-
   int16_t baroAlt;
   int16_t gpsAlt;
-
   int32_t latitude;
   int32_t longitude;
-
   uint8_t satellites;
   uint8_t gpsFix;
-
   uint16_t counter;
   uint8_t checksum;
 };
@@ -72,6 +70,19 @@ struct TelemetryPacket {
 
 TelemetryPacket pkt;
 
+// =====================================================
+// GPS drain (FIXED: time-based, not count-based)
+// =====================================================
+inline void pollGPS() {
+  while (GPS_SERIAL.available()) {
+    gps.encode(GPS_SERIAL.read());
+  }
+}
+
+
+// =====================================================
+// checksum
+// =====================================================
 uint8_t calculateChecksum(uint8_t* data, int len) {
   uint8_t sum = 0;
   for (int i = 0; i < len; i++) sum ^= data[i];
@@ -86,37 +97,41 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  // GPS UART
+  // ---------------- GPS ----------------
   GPS_SERIAL.setRX(9);
   GPS_SERIAL.setTX(8);
   GPS_SERIAL.begin(115200);
 
-  // Sparkfun OpenLog UART
+  unsigned long t0 = millis();
+while (millis() - t0 < 2000) {
+    pollGPS();   // let GPS boot and send initial sentences
+}
+  delay(2000);
+
+  // Minimal + stable config (IMPORTANT)
+  GPS_SERIAL.print("$PUBX,40,RMC,0,1,0,0*46\r\n");
+  GPS_SERIAL.print("$PUBX,40,GGA,0,1,0,0*5B\r\n");
+  GPS_SERIAL.print("$PUBX,40,GSA,0,1,0,0*4F\r\n");
+
+  // ---------------- LOGGER ----------------
   LOG_SERIAL.setRX(1);
   LOG_SERIAL.setTX(0);
   LOG_SERIAL.begin(9600);
 
-  // I2C + SPI
+  // ---------------- I2C ----------------
   Wire.begin();
   SPI.begin();
 
-  delay(500);
-
-  // =====================================================
-  // LIS3DH INIT
-  // =====================================================
+  // ---------------- LIS ----------------
   if (!lis.begin(0x18)) {
-    Serial.println("LIS3DH not found at 0x18");
-    while (1) delay(10);
+    Serial.println("LIS FAIL");
+    while (1);
   }
-  Serial.println("LIS3DH detected");
   lis.setRange(LIS3DH_RANGE_16_G);
 
-  // =====================================================
-  // BMP388 INIT
-  // =====================================================
+  // ---------------- BMP ----------------
   if (!bmp.begin_I2C()) {
-    Serial.println("BMP388 Not Found");
+    Serial.println("BMP FAIL");
   }
 
   bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
@@ -124,22 +139,17 @@ void setup() {
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-  delay(50);
+  while (true) {
+    if (bmp.performReading()) {
+      LocalPressure = bmp.pressure;
+      if (LocalPressure > 95000) break;
+    }
+    delay(50);
+  }
 
- do {
-    while (!bmp.performReading()) { delay(100); }
-    LocalPressure = bmp.readPressure();
-    Serial.print("Reading: ");
-    Serial.println(LocalPressure / 100.0f);
-} while (LocalPressure < 95000.0f); // reject anything below ~950 hPa as bogus
-
-  Serial.println("Sensors initialized");
-
-  // =====================================================
-  // RADIO INIT
-  // =====================================================
+  // ---------------- RADIO ----------------
   if (radio.begin() != RADIOLIB_ERR_NONE) {
-    Serial.println("SX1280 FAIL");
+    Serial.println("RADIO FAIL");
     while (1);
   }
 
@@ -151,17 +161,11 @@ void setup() {
   radio.setOutputPower(10);
   radio.setCRC(true);
 
-  Serial.println("TX READY");
-
-  // INIT Logger
-
-  LOG_SERIAL.println("ms,ax_g,ay_g,az_g,temp_c,baro_m,gpsLat,gpsLon,sats,fix");
-  delay(5000);
-
-  // INIT PACKET
   memset(&pkt, 0, sizeof(pkt));
   pkt.magic = 0xABCD;
   pkt.version = 1;
+
+  Serial.println("READY");
 }
 
 // =====================================================
@@ -169,84 +173,110 @@ void setup() {
 // =====================================================
 void loop() {
 
-  // Feed all available GPS bytes to TinyGPSPlus
-  while (GPS_SERIAL.available()) {
-    gps.encode(GPS_SERIAL.read());
-  }
+  // =====================================================
+  // ALWAYS SERVICE GPS FIRST
+  // =====================================================
+  pollGPS();
 
-  // 50Hz SENSOR UPDATE
+  // =====================================================
+  // SENSOR UPDATE
+  // =====================================================
   if (sensorTimer.hasPassed(20, true)) {
+
+    pollGPS();
 
     sensors_event_t event;
     lis.getEvent(&event);
 
-    bmp.performReading();
+    bool bmpOK = bmp.performReading();
 
-    float temp = bmp.temperature;
-    float baroAlt = 44330.0f * (1.0f - pow(bmp.pressure / LocalPressure, 0.1903f));
+    pollGPS();
 
-    pkt.xAcc = event.acceleration.x * 100;
-    pkt.yAcc = event.acceleration.y * 100;
-    pkt.zAcc = event.acceleration.z * 100;
+    if (bmpOK) {
 
-    pkt.temperature = temp * 100;
-    pkt.baroAlt = baroAlt * 10;
+      float temp = bmp.temperature;
+      float baroAlt =
+        44330.0f * (1.0f - pow(bmp.pressure / LocalPressure, 0.1903f));
 
-    // GPS: require a valid fix with at least 6 satellites
-    bool goodFix = gps.location.isValid()
-                && gps.satellites.isValid()
-                && gps.satellites.value() >= 6;
+      pkt.xAcc = event.acceleration.x * 100;
+      pkt.yAcc = event.acceleration.y * 100;
+      pkt.zAcc = event.acceleration.z * 100;
+      pkt.temperature = temp * 100;
+      pkt.baroAlt = baroAlt * 10;
 
-    if (goodFix) {
-      // Convert double degrees → int32 in units of 1e-7 degrees, matching your old UBX format
-      pkt.latitude   = (int32_t)(gps.location.lat() * 1e7);
-      pkt.longitude  = (int32_t)(gps.location.lng() * 1e7);
-      pkt.gpsAlt     = gps.altitude.isValid() ? (int16_t)(gps.altitude.meters()) : 0;
-      pkt.satellites = (uint8_t)gps.satellites.value();
-      pkt.gpsFix     = 3;   // TinyGPSPlus doesn't expose UBX fix type; 3 = 3D fix equivalent
-    } else {
-      pkt.latitude   = 0;
-      pkt.longitude  = 0;
-      pkt.gpsAlt     = 0;
-      pkt.satellites = gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0;
-      pkt.gpsFix     = 0;
+      // =====================================================
+      // GPS FIX HANDLING (FIXED LOGIC)
+      // =====================================================
+
+      static int32_t lastLat = 0;
+      static int32_t lastLon = 0;
+      static int16_t lastAlt = 0;
+      static uint8_t lastSats = 0;
+
+      if (gps.location.isUpdated()) {
+        lastLat = gps.location.lat() * 1e7;
+        lastLon = gps.location.lng() * 1e7;
+      }
+
+      if (gps.altitude.isUpdated()) {
+        lastAlt = gps.altitude.meters();
+      }
+
+      if (gps.satellites.isUpdated()) {
+        lastSats = gps.satellites.value();
+      }
+
+      pkt.latitude = lastLat;
+      pkt.longitude = lastLon;
+      pkt.gpsAlt = lastAlt;
+      pkt.satellites = lastSats;
+
+      // FIX STATE (simple but stable)
+      pkt.gpsFix = (lastLat != 0 && lastLon != 0) ? 3 : 0;
+
+      char line[160];
+      snprintf(line, sizeof(line),
+        "%lu,%.3f,%.3f,%.3f,%.2f,%.1f,%.6f,%.6f,%u,%u\n",
+        millis(),
+        event.acceleration.x / 9.81f,
+        event.acceleration.y / 9.81f,
+        event.acceleration.z / 9.81f,
+        temp,
+        baroAlt,
+        pkt.latitude / 1e7f,
+        pkt.longitude / 1e7f,
+        pkt.satellites,
+        pkt.gpsFix
+      );
+
+      LOG_SERIAL.print(line);
     }
-
-    char line[160];
-
-    snprintf(line, sizeof(line),
-    "%lu,%.3f,%.3f,%.3f,%.2f,%.1f,%.6f,%.6f,%u,%u\n",
-    millis(),
-    event.acceleration.x / 9.81f,   // G
-    event.acceleration.y / 9.81f,
-    event.acceleration.z / 9.81f,
-    temp,                             // °C
-    baroAlt,                          // m
-    pkt.latitude / 1e7f,                     // float, in deg 
-    pkt.longitude / 1e7f,
-    pkt.satellites,
-    pkt.gpsFix
-);
-
-LOG_SERIAL.print(line);
   }
-  // 10Hz TX
+
+  // =====================================================
+  // RADIO TX (NON-BLOCKING)
+  // =====================================================
   if (txTimer.hasPassed(100, true)) {
 
-    static uint16_t counter = 0;
+    pollGPS();
 
+    if (txBusy) {
+      int state = radio.getIrqFlags();
+
+      if (state & RADIOLIB_SX128X_IRQ_TX_DONE) {
+        radio.clearIrqFlags(RADIOLIB_SX128X_IRQ_TX_DONE);
+        txBusy = false;
+      }
+    }
+
+    static uint16_t counter = 0;
     pkt.counter = counter++;
     pkt.checksum = calculateChecksum((uint8_t*)&pkt, sizeof(pkt) - 1);
 
-    int txState = radio.transmit((uint8_t*)&pkt, sizeof(pkt));
+    int txState = radio.startTransmit((uint8_t*)&pkt, sizeof(pkt));
 
-Serial.print("TX state = ");
-Serial.println(txState);
-
-if (txState != RADIOLIB_ERR_NONE) {
-  Serial.println("TX FAIL");
-} else {
-  Serial.println("TX OK");
-}
+    if (txState == RADIOLIB_ERR_NONE) {
+      txBusy = true;
+    }
   }
 }

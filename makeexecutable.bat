@@ -1,0 +1,1 @@
+python -m PyInstaller --onefile --windowed --icon=icon.ico --name "Rocketry_GCS" main.py
