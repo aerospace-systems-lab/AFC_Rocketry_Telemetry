@@ -71,13 +71,19 @@ struct TelemetryPacket {
 TelemetryPacket pkt;
 
 // =====================================================
-// GPS drain (FIXED: time-based, not count-based)
+// GPS data struct to be created by core 1 and ready by core 0
 // =====================================================
-inline void pollGPS() {
-  while (GPS_SERIAL.available()) {
-    gps.encode(GPS_SERIAL.read());
-  }
-}
+
+struct GPSData {
+  int32_t  latitude;
+  int32_t  longitude;
+  int16_t  altitude;
+  uint8_t  satellites;
+  uint8_t  fix;
+};
+
+GPSData sharedGPS;        // written by Core 1, read by Core 0
+mutex_t gpsMutex;         // Pico SDK mutex
 
 
 // =====================================================
@@ -90,9 +96,10 @@ uint8_t calculateChecksum(uint8_t* data, int len) {
 }
 
 // =====================================================
-// SETUP
+// SETUP Core 0
 // =====================================================
 void setup() {
+  mutex_init(&gpsMutex);  // <-- first thing
 
   Serial.begin(115200);
   delay(1000);
@@ -102,32 +109,32 @@ void setup() {
   GPS_SERIAL.setTX(8);
   GPS_SERIAL.begin(115200);
 
-  unsigned long t0 = millis();
-while (millis() - t0 < 2000) {
-    pollGPS();   // let GPS boot and send initial sentences
-}
   delay(2000);
-
-  // Minimal + stable config (IMPORTANT)
-  GPS_SERIAL.print("$PUBX,40,RMC,0,1,0,0*46\r\n");
-  GPS_SERIAL.print("$PUBX,40,GGA,0,1,0,0*5B\r\n");
-  GPS_SERIAL.print("$PUBX,40,GSA,0,1,0,0*4F\r\n");
 
   // ---------------- LOGGER ----------------
   LOG_SERIAL.setRX(1);
   LOG_SERIAL.setTX(0);
   LOG_SERIAL.begin(9600);
+  delay(1000);
+  LOG_SERIAL.print("millis,ax_ms2,ay_ms2,az_ms2,temp_c,baro_alt_m,gps_alt_m,lat,lon,sats,gps_fix\n");
 
   // ---------------- I2C ----------------
   Wire.begin();
+  delay(1000);
+
   SPI.begin();
+  delay(1000);
 
   // ---------------- LIS ----------------
+
+  
   if (!lis.begin(0x18)) {
     Serial.println("LIS FAIL");
     while (1);
   }
   lis.setRange(LIS3DH_RANGE_16_G);
+
+
 
   // ---------------- BMP ----------------
   if (!bmp.begin_I2C()) {
@@ -138,6 +145,7 @@ while (millis() - t0 < 2000) {
   bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   bmp.setOutputDataRate(BMP3_ODR_50_HZ);
+
 
   while (true) {
     if (bmp.performReading()) {
@@ -165,32 +173,41 @@ while (millis() - t0 < 2000) {
   pkt.magic = 0xABCD;
   pkt.version = 1;
 
+  GPS_SERIAL.print("$PUBX,40,RMC,0,1,0,0*46\r\n");
+  GPS_SERIAL.print("$PUBX,40,GGA,0,1,0,0*5B\r\n");
+  GPS_SERIAL.print("$PUBX,40,GSA,0,1,0,0*4F\r\n");
+
   Serial.println("READY");
 }
 
+
 // =====================================================
-// LOOP
+// SETUP Core 1
+// =====================================================
+void setup1() {
+}
+
+
+// =====================================================
+// LOOP Core 0
 // =====================================================
 void loop() {
-
-  // =====================================================
-  // ALWAYS SERVICE GPS FIRST
-  // =====================================================
-  pollGPS();
 
   // =====================================================
   // SENSOR UPDATE
   // =====================================================
   if (sensorTimer.hasPassed(20, true)) {
 
-    pollGPS();
-
+    GPSData snap;
+    mutex_enter_blocking(&gpsMutex);
+    snap = sharedGPS;
+    mutex_exit(&gpsMutex);
+  
     sensors_event_t event;
     lis.getEvent(&event);
 
     bool bmpOK = bmp.performReading();
 
-    pollGPS();
 
     if (bmpOK) {
 
@@ -203,50 +220,28 @@ void loop() {
       pkt.zAcc = event.acceleration.z * 100;
       pkt.temperature = temp * 100;
       pkt.baroAlt = baroAlt * 10;
+   
 
-      // =====================================================
-      // GPS FIX HANDLING (FIXED LOGIC)
-      // =====================================================
-
-      static int32_t lastLat = 0;
-      static int32_t lastLon = 0;
-      static int16_t lastAlt = 0;
-      static uint8_t lastSats = 0;
-
-      if (gps.location.isUpdated()) {
-        lastLat = gps.location.lat() * 1e7;
-        lastLon = gps.location.lng() * 1e7;
-      }
-
-      if (gps.altitude.isUpdated()) {
-        lastAlt = gps.altitude.meters();
-      }
-
-      if (gps.satellites.isUpdated()) {
-        lastSats = gps.satellites.value();
-      }
-
-      pkt.latitude = lastLat;
-      pkt.longitude = lastLon;
-      pkt.gpsAlt = lastAlt;
-      pkt.satellites = lastSats;
-
-      // FIX STATE (simple but stable)
-      pkt.gpsFix = (lastLat != 0 && lastLon != 0) ? 3 : 0;
+      pkt.latitude   = snap.latitude;
+      pkt.longitude  = snap.longitude;
+      pkt.gpsAlt     = snap.altitude;
+      pkt.satellites = snap.satellites;
+      pkt.gpsFix     = snap.fix;
 
       char line[160];
       snprintf(line, sizeof(line),
-        "%lu,%.3f,%.3f,%.3f,%.2f,%.1f,%.6f,%.6f,%u,%u\n",
+        "%lu,%.3f,%.3f,%.3f,%.2f,%.1f,%.1f,%.6f,%.6f,%u,%u\n",
         millis(),
-        event.acceleration.x / 9.81f,
-        event.acceleration.y / 9.81f,
-        event.acceleration.z / 9.81f,
+        event.acceleration.x,
+        event.acceleration.y,
+        event.acceleration.z,
         temp,
         baroAlt,
-        pkt.latitude / 1e7f,
-        pkt.longitude / 1e7f,
-        pkt.satellites,
-        pkt.gpsFix
+        (float)snap.altitude,
+        snap.latitude / 1e7f,
+        snap.longitude / 1e7f,
+        snap.satellites,
+        snap.fix
       );
 
       LOG_SERIAL.print(line);
@@ -257,8 +252,6 @@ void loop() {
   // RADIO TX (NON-BLOCKING)
   // =====================================================
   if (txTimer.hasPassed(100, true)) {
-
-    pollGPS();
 
     if (txBusy) {
       int state = radio.getIrqFlags();
@@ -277,6 +270,35 @@ void loop() {
 
     if (txState == RADIOLIB_ERR_NONE) {
       txBusy = true;
+    }
+  }
+}
+
+// =====================================================
+// LOOP Core 1
+// =====================================================
+
+void loop1() {
+  while (GPS_SERIAL.available()) {
+    if (gps.encode(GPS_SERIAL.read())) {
+      // Full sentence decoded — update shared struct
+      if (gps.location.isUpdated()) {
+        mutex_enter_blocking(&gpsMutex);
+        sharedGPS.latitude   = gps.location.lat()  * 1e7;
+        sharedGPS.longitude  = gps.location.lng()  * 1e7;
+        sharedGPS.fix       = (gps.location.isValid()) ? 3 : 0;
+        mutex_exit(&gpsMutex);
+      }
+      if (gps.altitude.isUpdated()) {
+        mutex_enter_blocking(&gpsMutex);
+        sharedGPS.altitude   = gps.altitude.meters();
+        mutex_exit(&gpsMutex);
+      }
+      if (gps.satellites.isUpdated()) {
+        mutex_enter_blocking(&gpsMutex);
+        sharedGPS.satellites = gps.satellites.value();
+        mutex_exit(&gpsMutex);
+      }
     }
   }
 }
